@@ -1,0 +1,60 @@
+name: Patch Conflict Notifications
+
+on:
+  pull_request:
+    types: [opened]
+    
+jobs:
+  notify-conflicts:
+    if: contains(github.event.pull_request.labels.*.name, 'needs-manual-intervention')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Slack notification
+        if: ${{ secrets.SLACK_WEBHOOK_URL }}
+        uses: 8398a7/action-slack@v3
+        with:
+          status: custom
+          custom_payload: |
+            {
+              attachments: [{
+                color: 'warning',
+                title: 'Kubernetes Fork: Manual Intervention Required',
+                text: `Patch conflicts detected for upstream tag ${process.env.AS_PULL_REQUEST_TITLE.match(/v[\d.]+/)[0]}`,
+                fields: [
+                  {
+                    title: 'PR',
+                    value: `<${process.env.AS_PULL_REQUEST_HTML_URL}|${process.env.AS_PULL_REQUEST_TITLE}>`,
+                    short: false
+                  }
+                ]
+              }]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          
+      - name: Send email notification
+        if: ${{ secrets.SMTP_SERVER }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Kubernetes Fork: Patch Conflicts for ${{ github.event.pull_request.title }}"
+          to: ${{ secrets.NOTIFICATION_EMAIL }}
+          from: GitHub Actions <noreply@github.com>
+          body: |
+            Patch conflicts were detected when syncing upstream Kubernetes.
+            
+            PR: ${{ github.event.pull_request.html_url }}
+            
+            Please review and manually resolve the conflicts.
+            
+      - name: Create GitHub Issue
+        uses: peter-evans/create-issue-from-file@v4
+        with:
+          title: "Patch Conflict: ${{ github.event.pull_request.title }}"
+          content-filepath: .github/ISSUE_TEMPLATE/patch-conflict.md
+          labels: |
+            patch-conflict
+            high-priority

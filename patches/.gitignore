@@ -1,0 +1,13 @@
+# Temporary patch files
+*.tmp
+*.bak
+*.orig
+*.rej
+
+# Keep the directory but ignore test files
+test-*
+temp-*
+
+# Editor backup files
+*~
+*.swp

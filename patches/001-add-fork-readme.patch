@@ -1,0 +1,41 @@
+From 0123456789abcdef0123456789abcdef01234567 Mon Sep 17 00:00:00 2001
+From: Fork Maintainer <fork@example.com>
+Date: Mon, 1 Sep 2025 00:00:00 +0000
+Subject: [PATCH] Add FORK-README.md to identify custom fork
+
+This patch adds a FORK-README.md file that documents this custom fork.
+
+---
+ FORK-README.md | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+ create mode 100644 FORK-README.md
+
+diff --git a/FORK-README.md b/FORK-README.md
+new file mode 100644
+index 0000000..1234567
+--- /dev/null
++++ b/FORK-README.md
+@@ -0,0 +1,21 @@
++# Kubernetes Custom Fork
++
++This is a custom fork of Kubernetes with organization-specific patches applied.
++
++## Fork Information
++
++- **Fork Version**: 1.0
++- **Based on**: Kubernetes upstream
++- **Maintained by**: Your Organization
++
++## Applied Patches
++
++All custom modifications are maintained as patches in the `patches/` directory.
++
++## Sync Process
++
++This fork is automatically synchronized with upstream Kubernetes releases using GitHub Actions.
++
++## Contributing
++
++To add new modifications, create patches and add them to the `patches/` directory.
+-- 
+2.34.1

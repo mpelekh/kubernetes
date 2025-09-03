@@ -1,0 +1,268 @@
+name: Sync Upstream Kubernetes
+
+on:
+  # Run every hour to check for new releases
+  schedule:
+    - cron: '0 * * * *'
+  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Specific tag to sync (optional)'
+        required: false
+        type: string
+
+env:
+  UPSTREAM_REPO: kubernetes/kubernetes
+  PATCHES_DIR: patches
+  
+jobs:
+  check-new-releases:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tags: ${{ steps.check.outputs.new_tags }}
+      has_new_tags: ${{ steps.check.outputs.has_new_tags }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          
+      - name: Check for new upstream tags
+        id: check
+        run: |
+          # Enable debugging
+          set -x
+          
+          # Add upstream remote
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream --tags
+          
+          # Get list of upstream tags not in our fork
+          if [[ -n "${{ github.event.inputs.tag }}" ]]; then
+            # Manual trigger with specific tag
+            NEW_TAGS="${{ github.event.inputs.tag }}"
+          else
+            # Get all v* tags from upstream (don't rely on --merged which may miss release tags)
+            echo "Fetching all upstream tags..."
+            ALL_UPSTREAM=$(git ls-remote --tags upstream | awk '{print $2}' | grep -E '^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | sed 's|refs/tags/||' | sort)
+            echo "DEBUG: Found $(echo "$ALL_UPSTREAM" | wc -l) upstream tags"
+            echo "DEBUG: First 5 upstream tags: $(echo "$ALL_UPSTREAM" | head -5 | tr '\n' ' ')"
+            
+            PROCESSED=$(git tag -l '*-fork.*' | sed 's/-fork\.[0-9]*$//' | sort)
+            echo "DEBUG: Found $(echo "$PROCESSED" | wc -l) processed fork tags"
+            echo "DEBUG: First 5 processed tags: $(echo "$PROCESSED" | head -5 | tr '\n' ' ')"
+            
+            CANDIDATES=$(comm -23 <(echo "$ALL_UPSTREAM") <(echo "$PROCESSED"))
+            echo "DEBUG: Found $(echo "$CANDIDATES" | wc -l) candidate tags"
+            
+            # Filter to only include versions >= v1.20.0
+            NEW_TAGS=""
+            for tag in $CANDIDATES; do
+              if [[ $tag =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+                MAJOR=${BASH_REMATCH[1]}
+                MINOR=${BASH_REMATCH[2]}
+                if [[ $MAJOR -gt 1 ]] || [[ $MAJOR -eq 1 && $MINOR -ge 20 ]]; then
+                  NEW_TAGS="$NEW_TAGS$tag"$'\n'
+                fi
+              fi
+            done
+            # Limit to 5 tags but keep newlines for JSON conversion
+            NEW_TAGS=$(echo "$NEW_TAGS" | head -5)
+            echo "DEBUG: Final NEW_TAGS (first 50 chars): ${NEW_TAGS:0:50}"
+          fi
+          
+          if [[ -n "$NEW_TAGS" ]]; then
+            echo "has_new_tags=true" >> $GITHUB_OUTPUT
+            # Convert to JSON array (properly handle newlines)
+            JSON_TAGS=$(echo "$NEW_TAGS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+            echo "new_tags=$JSON_TAGS" >> $GITHUB_OUTPUT
+            echo "Found new tags: $(echo "$NEW_TAGS" | tr '\n' ' ')"
+          else
+            echo "has_new_tags=false" >> $GITHUB_OUTPUT
+            echo "No new tags found"
+          fi
+
+  process-tag:
+    needs: check-new-releases
+    if: needs.check-new-releases.outputs.has_new_tags == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tag: ${{ fromJson(needs.check-new-releases.outputs.new_tags) }}
+      max-parallel: 1
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Configure git
+        run: |
+          git config user.name "GitHub Actions Bot"
+          git config user.email "actions@github.com"
+          
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/${{ env.UPSTREAM_REPO }}.git
+          git fetch upstream --tags
+          
+      - name: Create patch branch
+        id: patch
+        run: |
+          TAG="${{ matrix.tag }}"
+          BRANCH="auto-patch-${TAG}"
+          FORK_TAG="${TAG}-fork.1"
+          
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+          echo "fork_tag=$FORK_TAG" >> $GITHUB_OUTPUT
+          
+          # Check if we already have this fork tag
+          if git rev-parse "$FORK_TAG" >/dev/null 2>&1; then
+            echo "Tag $FORK_TAG already exists, skipping"
+            echo "skip=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Save patches directory before switching branches
+          if [[ -d "${{ env.PATCHES_DIR }}" ]]; then
+            cp -r "${{ env.PATCHES_DIR }}" /tmp/saved-patches
+          fi
+          
+          # Create branch from upstream tag
+          git checkout -b "$BRANCH" "$TAG"
+          
+          # Restore patches directory
+          if [[ -d "/tmp/saved-patches" ]]; then
+            cp -r /tmp/saved-patches "${{ env.PATCHES_DIR }}"
+          fi
+          
+      - name: Apply patches
+        if: steps.patch.outputs.skip != 'true'
+        id: apply
+        run: |
+          PATCHES_APPLIED=0
+          PATCHES_FAILED=0
+          FAILED_PATCHES=""
+          PATCH_COUNT=0
+          
+          # Count patches first
+          if [[ -d "${{ env.PATCHES_DIR }}" ]]; then
+            PATCH_COUNT=$(find "${{ env.PATCHES_DIR }}" -name "*.patch" -type f | wc -l)
+          fi
+          
+          if [[ $PATCH_COUNT -eq 0 ]]; then
+            echo "::warning::No patches found in ${{ env.PATCHES_DIR }}"
+            echo "::notice::Add your custom patches to the patches/ directory before syncing"
+          else
+            # Apply patches in order
+            for patch in ${{ env.PATCHES_DIR }}/*.patch; do
+              if [[ -f "$patch" ]]; then
+                echo "Applying patch: $patch"
+                if git apply --check "$patch" 2>/dev/null; then
+                  git apply "$patch"
+                  # Only add files changed by the patch, not the patches directory itself
+                  git add -u .
+                  # Add new files if any (handle case where grep returns nothing)
+                  NEW_FILES=$(git ls-files -o --exclude-standard | grep -v '^patches/' || true)
+                  if [[ -n "$NEW_FILES" ]]; then
+                    echo "$NEW_FILES" | xargs git add
+                  fi
+                  git commit -m "Apply patch: $(basename "$patch")"
+                  PATCHES_APPLIED=$((PATCHES_APPLIED + 1))
+                else
+                  echo "::warning::Failed to apply patch: $patch"
+                  PATCHES_FAILED=$((PATCHES_FAILED + 1))
+                  FAILED_PATCHES="${FAILED_PATCHES}$(basename "$patch")\n"
+                fi
+              fi
+            done
+          fi
+          
+          echo "patches_applied=$PATCHES_APPLIED" >> $GITHUB_OUTPUT
+          echo "patches_failed=$PATCHES_FAILED" >> $GITHUB_OUTPUT
+          echo "failed_patches<<EOF" >> $GITHUB_OUTPUT
+          echo -e "$FAILED_PATCHES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          
+          if [[ $PATCHES_FAILED -gt 0 ]]; then
+            echo "conflicts=true" >> $GITHUB_OUTPUT
+          else
+            echo "conflicts=false" >> $GITHUB_OUTPUT
+          fi
+          
+      - name: Create tag if no conflicts
+        if: steps.patch.outputs.skip != 'true' && steps.apply.outputs.conflicts == 'false' && steps.apply.outputs.patches_applied != '0'
+        run: |
+          # Create annotated tag
+          git tag -a "${{ steps.patch.outputs.fork_tag }}" -m "Fork of Kubernetes ${{ steps.patch.outputs.tag }} with custom patches"
+          
+          # Push branch and tag
+          git push origin "${{ steps.patch.outputs.branch }}"
+          git push origin "${{ steps.patch.outputs.fork_tag }}"
+          
+      - name: Skip if no patches
+        if: steps.patch.outputs.skip != 'true' && steps.apply.outputs.patches_applied == '0'
+        run: |
+          echo "::warning::No patches were applied - skipping tag creation"
+          echo "::notice::Please add your custom patches to the patches/ directory"
+          
+      - name: Create PR if conflicts
+        if: steps.patch.outputs.skip != 'true' && steps.apply.outputs.conflicts == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: ${{ steps.patch.outputs.branch }}
+          title: "Manual intervention required: Patch conflicts for ${{ steps.patch.outputs.tag }}"
+          body: |
+            ## Upstream Sync Conflict
+            
+            Attempting to sync upstream tag `${{ steps.patch.outputs.tag }}` resulted in patch conflicts.
+            
+            ### Summary
+            - **Patches Applied**: ${{ steps.apply.outputs.patches_applied }}
+            - **Patches Failed**: ${{ steps.apply.outputs.patches_failed }}
+            
+            ### Failed Patches
+            ```
+            ${{ steps.apply.outputs.failed_patches }}
+            ```
+            
+            ### Next Steps
+            1. Checkout this branch locally
+            2. Manually resolve conflicts in the failed patches
+            3. Apply the remaining patches
+            4. Create the fork tag: `${{ steps.patch.outputs.fork_tag }}`
+            5. Push the tag and close this PR
+            
+            ### Commands to resolve locally
+            ```bash
+            git checkout ${{ steps.patch.outputs.branch }}
+            # Manually fix and apply failed patches
+            # Then create and push the tag:
+            git tag -a "${{ steps.patch.outputs.fork_tag }}" -m "Fork of Kubernetes ${{ steps.patch.outputs.tag }} with custom patches"
+            git push origin "${{ steps.patch.outputs.fork_tag }}"
+            ```
+          labels: |
+            upstream-sync
+            needs-manual-intervention
+          assignees: ${{ github.repository_owner }}
+          
+      - name: Create GitHub Release
+        if: steps.patch.outputs.skip != 'true' && steps.apply.outputs.conflicts == 'false' && steps.apply.outputs.patches_applied != '0'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.patch.outputs.fork_tag }}
+          name: ${{ steps.patch.outputs.fork_tag }}
+          body: |
+            Fork of Kubernetes ${{ steps.patch.outputs.tag }} with custom patches applied.
+            
+            ### Patches Applied
+            - Total patches: ${{ steps.apply.outputs.patches_applied }}
+            
+            ### Upstream Release
+            See the [upstream release notes](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.patch.outputs.tag }})
+          draft: false
+          prerelease: false
